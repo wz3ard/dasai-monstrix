@@ -1,345 +1,372 @@
 #include <Wire.h>
-#include <U8g2lib.h>
-#include <WiFi.h>
-#include <WiFiManager.h>
-#include <time.h>
-#include <RTClib.h>
-#include <INA226.h>
-#include <ArduinoJson.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <AnimatedGIF.h>
+#include "animation.h"
 
-// ========== НАСТРОЙКИ (изменяются через Web Portal) ==========
-// Параметры по умолчанию (будут перезаписаны после настройки)
-char ntpServer[40] = "pool.ntp.org";
-long gmtOffsetSec = 10800;  // GMT+3 по умолчанию
-int daylightOffsetSec = 0;
+// ===== I2C OLED Configuration =====
+#define I2C_SDA 8
+#define I2C_SCL 9
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_ADDR 0x3C
 
-char weatherCity[50] = "Moscow";
-char weatherApiKey[33] = "";  // Ключ API для OpenWeatherMap
+// ===== MPU6050 Configuration =====
+#define MPU6050_ADDR 0x68
 
-// ========== ИНИЦИАЛИЗАЦИЯ КОМПОНЕНТОВ ==========
-// Для OLED 1.3" 128x64 (SSD1306 или SH1106)
-U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+// ===== Sound Configuration =====
+#define SPEAKER_PIN 3
 
-RTC_DS3231 rtc;
-INA226 ina226;
+// ===== Emotion Timing Configuration =====
+#define SHAKE_COOLDOWN 100
+#define EMOTION_INTERVAL 10000
+#define ANGRY_DURATION 3000
 
-// ========== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ==========
-bool wifiConnected = false;
-unsigned long lastWeatherUpdate = 0;
-float currentVoltage = 0.0;
-float currentTemperature = 0.0;
-String weatherCondition = "";
-float weatherTemp = 0.0;
-int weatherHumidity = 0;
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+AnimatedGIF gif;
 
-// ========== WEB-ПАРАМЕТРЫ ДЛЯ НАСТРОЙКИ ==========
-WiFiManager wifiManager;
-WiFiManagerParameter custom_ntp("ntp", "NTP Server", ntpServer, 40);
-WiFiManagerParameter custom_gmt("gmt", "GMT Offset (seconds)", "10800", 8);
-WiFiManagerParameter custom_city("city", "Weather City", weatherCity, 50);
-WiFiManagerParameter custom_api("apikey", "Weather API Key", weatherApiKey, 32);
+int16_t accX, accY, accZ;
+float gForceX, gForceY, gForceZ;
 
-// ========== ПРОТОТИПЫ ФУНКЦИЙ ==========
-void saveConfigCallback();
-void configModeCallback(WiFiManager *myWiFiManager);
-bool loadConfig();
-void initWiFiManager();
-void updateTimeFromNTP();
-void updateWeather();
-void updateDisplay();
-String getFormattedTime();
-String getFormattedDate();
+enum EmotionState {
+  NORMAL,
+  ANGRY
+};
 
-// ========== SETUP ==========
+EmotionState currentEmotion = NORMAL;
+unsigned long lastShakeTime = 0;
+unsigned long lastShakeCheckTime = 0;
+unsigned long lastEmotionChange = 0;
+unsigned long angryStartTime = 0;
+bool isShaking = false;
+bool gifPlaying = false;
+
+struct SoundNote {
+  int frequency;
+  int duration;
+};
+
+const int ANGRY_MELODY_LENGTH = 10;
+SoundNote angryMelody[ANGRY_MELODY_LENGTH] = {
+  {1000, 200}, {1000, 200}, {800, 150}, {1200, 150},
+  {600, 300}, {1400, 100}, {1400, 100}, {500, 400},
+  {1000, 200}, {0, 500}
+};
+
+bool soundPlaying = false;
+int currentNoteIndex = 0;
+unsigned long noteStartTime = 0;
+int currentFrequency = 0;
+int currentDuration = 0;
+
+void setupMPU6050() {
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x6B);
+  Wire.write(0);
+  Wire.endTransmission(true);
+  
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x1C);
+  Wire.write(0x00);
+  Wire.endTransmission(true);
+  delay(100);
+}
+
+void readMPU6050() {
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x3B);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU6050_ADDR, 6, true);
+  
+  if (Wire.available() >= 6) {
+    accX = Wire.read() << 8 | Wire.read();
+    accY = Wire.read() << 8 | Wire.read();
+    accZ = Wire.read() << 8 | Wire.read();
+    
+    gForceX = accX / 16384.0;
+    gForceY = accY / 16384.0;
+    gForceZ = accZ / 16384.0;
+  }
+}
+
+bool isShakeDetected() {
+  readMPU6050();
+  float totalAcc = abs(gForceX) + abs(gForceY) + abs(gForceZ);
+  return (totalAcc > 2.0);
+}
+
+void startSound() {
+  if (soundPlaying) {
+    ledcDetach(SPEAKER_PIN);
+    pinMode(SPEAKER_PIN, OUTPUT);
+    digitalWrite(SPEAKER_PIN, LOW);
+  }
+  
+  soundPlaying = true;
+  currentNoteIndex = 0;
+  noteStartTime = millis();
+  
+  currentFrequency = angryMelody[0].frequency;
+  currentDuration = angryMelody[0].duration;
+  
+  if (currentFrequency > 0) {
+    ledcAttach(SPEAKER_PIN, currentFrequency, 8);
+    ledcWrite(SPEAKER_PIN, 128);
+  }
+}
+
+void updateSound() {
+  if (!soundPlaying) return;
+  
+  unsigned long now = millis();
+  
+  if (now - noteStartTime >= currentDuration) {
+    currentNoteIndex++;
+    
+    if (currentNoteIndex >= ANGRY_MELODY_LENGTH) {
+      soundPlaying = false;
+      ledcDetach(SPEAKER_PIN);
+      pinMode(SPEAKER_PIN, OUTPUT);
+      digitalWrite(SPEAKER_PIN, LOW);
+      return;
+    }
+    
+    currentFrequency = angryMelody[currentNoteIndex].frequency;
+    currentDuration = angryMelody[currentNoteIndex].duration;
+    noteStartTime = now;
+    
+    if (currentFrequency > 0) {
+      ledcAttach(SPEAKER_PIN, currentFrequency, 8);
+      ledcWrite(SPEAKER_PIN, 128);
+    } else {
+      ledcDetach(SPEAKER_PIN);
+      pinMode(SPEAKER_PIN, OUTPUT);
+      digitalWrite(SPEAKER_PIN, LOW);
+    }
+  }
+}
+
+void playToneBlocking(int frequency, int duration) {
+  if (frequency == 0) {
+    delay(duration);
+    return;
+  }
+  
+  ledcAttach(SPEAKER_PIN, frequency, 8);
+  ledcWrite(SPEAKER_PIN, 128);
+  delay(duration);
+  ledcDetach(SPEAKER_PIN);
+  pinMode(SPEAKER_PIN, OUTPUT);
+  digitalWrite(SPEAKER_PIN, LOW);
+  delay(50);
+}
+
+void playStartupMelody() {
+  int melody[] = {262, 330, 392, 523};
+  int durations[] = {300, 300, 300, 600};
+  
+  for (int i = 0; i < 4; i++) {
+    playToneBlocking(melody[i], durations[i]);
+    delay(100);
+  }
+}
+
+void playAngrySound() {
+  startSound();
+}
+
+void transformCoordinates(int &x, int &y, int rotation) {
+  int oldX = x, oldY = y;
+  switch(rotation) {
+    case 2:
+      x = SCREEN_WIDTH - 1 - oldX;
+      y = SCREEN_HEIGHT - 1 - oldY;
+      break;
+  }
+}
+
+void GIFDraw(GIFDRAW* pDraw) {
+  uint8_t* s;
+  int x, y, iWidth;
+  static uint8_t ucPalette[256];
+  
+  uint8_t* buffer = display.getBuffer();
+  
+  if (pDraw->y == 0) {
+    for (x = 0; x < 256; x++) {
+      uint16_t usColor = pDraw->pPalette[x];
+      if (usColor == 0) {
+        ucPalette[x] = 0;
+        continue;
+      }
+      int r = (usColor & 0xF800) >> 11;
+      int g = (usColor & 0x07E0) >> 5;
+      int b = usColor & 0x001F;
+      int brightness = (r * 299 + g * 587 + b * 114) / 1000;
+      ucPalette[x] = (brightness > 15) ? 1 : 0;
+    }
+  }
+  
+  y = pDraw->iY + pDraw->y;
+  iWidth = pDraw->iWidth;
+  if (iWidth > SCREEN_WIDTH) iWidth = SCREEN_WIDTH;
+  
+  s = pDraw->pPixels;
+  
+  for (x = 0; x < iWidth; x++) {
+    uint8_t c;
+    if (pDraw->ucHasTransparency) {
+      c = *s++;
+      if (c == pDraw->ucTransparent) continue;
+    } else {
+      c = pDraw->pPixels[x];
+    }
+    
+    int origX = pDraw->iX + x;
+    int origY = y;
+    
+    int rotX = origX, rotY = origY;
+    transformCoordinates(rotX, rotY, 2);
+    
+    if (rotX >= 0 && rotX < SCREEN_WIDTH && rotY >= 0 && rotY < SCREEN_HEIGHT) {
+      int byteIdx = rotX + (rotY / 8) * SCREEN_WIDTH;
+      int bitIdx = rotY % 8;
+      
+      if (ucPalette[c]) {
+        buffer[byteIdx] |= (1 << bitIdx);
+      } else {
+        buffer[byteIdx] &= ~(1 << bitIdx);
+      }
+    }
+  }
+  
+  if (pDraw->y == pDraw->iHeight - 1) {
+    display.display();
+  }
+}
+
+void startGIF(uint8_t* gifData, int size) {
+  if (gifPlaying) {
+    gif.close();
+  }
+  display.clearDisplay();
+  display.display();
+  delay(10);
+  
+  if (gif.open(gifData, size, GIFDraw)) {
+    gifPlaying = true;
+  }
+}
+
+void updateGIF() {
+  if (gifPlaying) {
+    if (!gif.playFrame(true, NULL)) {
+      gif.close();
+      gifPlaying = false;
+    }
+  }
+}
+
+void setRandomNormalEmotion() {
+  int r = random(1, 33);
+  
+  switch(r) {
+    case 1: startGIF((uint8_t*)_1, sizeof(_1)); break;
+    case 2: startGIF((uint8_t*)_2, sizeof(_2)); break;
+    case 3: startGIF((uint8_t*)_3, sizeof(_3)); break;
+    case 4: startGIF((uint8_t*)_4, sizeof(_4)); break;
+    case 5: startGIF((uint8_t*)_5, sizeof(_5)); break;
+    case 6: startGIF((uint8_t*)_6, sizeof(_6)); break;
+    case 7: startGIF((uint8_t*)_7, sizeof(_7)); break;
+    case 8: startGIF((uint8_t*)_8, sizeof(_8)); break;
+    case 9: startGIF((uint8_t*)_9, sizeof(_9)); break;
+    case 10: startGIF((uint8_t*)_10, sizeof(_10)); break;
+    case 11: startGIF((uint8_t*)_11, sizeof(_11)); break;
+    case 12: startGIF((uint8_t*)_12, sizeof(_12)); break;
+    case 13: startGIF((uint8_t*)_13, sizeof(_13)); break;
+    case 14: startGIF((uint8_t*)_14, sizeof(_14)); break;
+    case 15: startGIF((uint8_t*)_15, sizeof(_15)); break;
+    case 16: startGIF((uint8_t*)_16, sizeof(_16)); break;
+    case 17: startGIF((uint8_t*)_17, sizeof(_17)); break;
+    case 18: startGIF((uint8_t*)_18, sizeof(_18)); break;
+    case 19: startGIF((uint8_t*)_19, sizeof(_19)); break;
+    case 20: startGIF((uint8_t*)_20, sizeof(_20)); break;
+    case 21: startGIF((uint8_t*)_21, sizeof(_21)); break;
+    case 22: startGIF((uint8_t*)_22, sizeof(_22)); break;
+    case 23: startGIF((uint8_t*)_23, sizeof(_23)); break;
+    case 24: startGIF((uint8_t*)_24, sizeof(_24)); break;
+    case 25: startGIF((uint8_t*)_25, sizeof(_25)); break;
+    case 26: startGIF((uint8_t*)_26, sizeof(_26)); break;
+    case 27: startGIF((uint8_t*)_27, sizeof(_27)); break;
+    case 28: startGIF((uint8_t*)_28, sizeof(_28)); break;
+    case 29: startGIF((uint8_t*)_29, sizeof(_29)); break;
+    case 30: startGIF((uint8_t*)_30, sizeof(_30)); break;
+    case 31: startGIF((uint8_t*)_31, sizeof(_31)); break;
+    case 32: startGIF((uint8_t*)_32, sizeof(_32)); break;
+    default: startGIF((uint8_t*)_1, sizeof(_1)); break;
+  }
+}
+
 void setup() {
-    Serial.begin(115200);
-    Serial.println("\n\nЗапуск устройства...");
-
-    // 1. Инициализация I2C шины
-    Wire.begin(9, 8);  // SDA=GPIO9, SCL=GPIO8
-    Serial.println("I2C шина инициализирована");
-
-    // 2. Инициализация OLED
-    u8g2.begin();
-    u8g2.setFont(u8g2_font_6x10_tr);
-    u8g2.enableUTF8Print();
-    u8g2.clearBuffer();
-    u8g2.drawStr(0, 10, "Загрузка...");
-    u8g2.sendBuffer();
-    Serial.println("OLED инициализирован");
-
-    // 3. Инициализация DS3231 RTC
-    if (!rtc.begin()) {
-        Serial.println("Ошибка: DS3231 не найден!");
-        u8g2.drawStr(0, 30, "Ошибка RTC!");
-        u8g2.sendBuffer();
-    } else {
-        Serial.println("DS3231 найден");
-    }
-
-    // 4. Инициализация INA226
-    if (!ina226.begin()) {
-        Serial.println("Ошибка: INA226 не найден!");
-        u8g2.drawStr(0, 40, "Ошибка INA226!");
-        u8g2.sendBuffer();
-    } else {
-        // Настройка INA226 (опционально)
-        ina226.setMaxCurrentShunt(5.0, 0.002);  // 5A max, 0.002 Ohm shunt
-        Serial.println("INA226 инициализирован");
-    }
-
-    delay(2000);
-
-    // 5. Загрузка сохранённых параметров
-    loadConfig();
-
-    // 6. Инициализация WiFiManager (точка доступа для настройки при первом запуске)
-    initWiFiManager();
-
-    // 7. Синхронизация времени
-    updateTimeFromNTP();
-
-    // 8. Первое обновление погоды
-    updateWeather();
-
-    Serial.println("Система готова к работе!");
+  pinMode(SPEAKER_PIN, OUTPUT);
+  
+  Wire.begin(I2C_SDA, I2C_SCL);
+  setupMPU6050();
+  
+  display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
+  display.setRotation(2);
+  
+  gif.begin(LITTLE_ENDIAN_PIXELS);
+  
+  startGIF((uint8_t*)intro, sizeof(intro));
+  
+  while (gifPlaying) {
+    updateGIF();
+    delay(10);
+  }
+  
+  delay(500);
+  
+  currentEmotion = NORMAL;
+  lastEmotionChange = millis();
+  setRandomNormalEmotion();
+  playStartupMelody();
 }
 
-// ========== LOOP ==========
 void loop() {
-    static unsigned long lastDisplayUpdate = 0;
-    static unsigned long lastMeasureTime = 0;
-    static unsigned long lastWeatherCheck = 0;
-
-    // Измерение напряжения каждые 500 мс
-    if (millis() - lastMeasureTime >= 500) {
-        lastMeasureTime = millis();
-        
-        // Чтение напряжения с INA226
-        currentVoltage = ina226.readBusVoltage();
-        
-        // Чтение температуры с DS3231 (опционально)
-        currentTemperature = rtc.getTemperature();
-        
-        Serial.printf("Напряжение: %.2f V, Температура: %.2f C\n", currentVoltage, currentTemperature);
-    }
-
-    // Обновление дисплея каждую секунду
-    if (millis() - lastDisplayUpdate >= 1000) {
-        lastDisplayUpdate = millis();
-        updateDisplay();
-    }
-
-    // Обновление погоды каждые 10 минут
-    if (millis() - lastWeatherCheck >= 600000) {  // 10 минут
-        lastWeatherCheck = millis();
-        if (WiFi.status() == WL_CONNECTED) {
-            updateWeather();
-        }
-    }
-
-    // Поддержание WiFi-соединения
-    if (WiFi.status() != WL_CONNECTED && wifiConnected) {
-        wifiConnected = false;
-        Serial.println("WiFi отключен, попытка переподключения...");
-    } else if (WiFi.status() == WL_CONNECTED && !wifiConnected) {
-        wifiConnected = true;
-        Serial.println("WiFi переподключен");
-        updateTimeFromNTP();  // Обновить время при переподключении
-        updateWeather();
-    }
-}
-
-// ========== ИНИЦИАЛИЗАЦИЯ WIFIMANAGER ==========
-void initWiFiManager() {
-    wifiManager.setSaveConfigCallback(saveConfigCallback);
-    wifiManager.setAPCallback(configModeCallback);
-    
-    // Добавление пользовательских параметров
-    wifiManager.addParameter(&custom_ntp);
-    wifiManager.addParameter(&custom_gmt);
-    wifiManager.addParameter(&custom_city);
-    wifiManager.addParameter(&custom_api);
-    
-    // Попытка подключения к сохранённой сети
-    if (!wifiManager.autoConnect("VoltClockSetup", "12345678")) {
-        Serial.println("Не удалось подключиться к WiFi");
-        // Продолжаем работу без WiFi (RTC будет показывать время)
-    } else {
-        wifiConnected = true;
-        Serial.println("Подключено к WiFi!");
-        Serial.print("IP адрес: ");
-        Serial.println(WiFi.localIP());
-    }
-}
-
-// Callback при сохранении параметров
-void saveConfigCallback() {
-    Serial.println("Параметры сохранены");
-    
-    // Сохранение параметров в NVS (энергонезависимую память)
-    strcpy(ntpServer, custom_ntp.getValue());
-    gmtOffsetSec = atol(custom_gmt.getValue());
-    strcpy(weatherCity, custom_city.getValue());
-    strcpy(weatherApiKey, custom_api.getValue());
-    
-    // Здесь можно сохранить параметры в файл или Preferences
-    // Для простоты — сохраняем в Preferences
-    #include <Preferences.h>
-    Preferences prefs;
-    prefs.begin("settings", false);
-    prefs.putString("ntp", ntpServer);
-    prefs.putLong("gmt", gmtOffsetSec);
-    prefs.putString("city", weatherCity);
-    prefs.putString("api", weatherApiKey);
-    prefs.end();
-}
-
-// Callback при входе в режим настройки AP
-void configModeCallback(WiFiManager *myWiFiManager) {
-    Serial.println("Режим настройки AP активирован");
-    Serial.print("SSID точки доступа: ");
-    Serial.println(myWiFiManager->getConfigPortalSSID());
-    
-    // Отображение информации на OLED
-    u8g2.clearBuffer();
-    u8g2.setFont(u8g2_font_6x10_tr);
-    u8g2.drawStr(0, 10, "Режим настройки");
-    u8g2.drawStr(0, 25, "Подключитесь к:");
-    u8g2.drawStr(0, 40, myWiFiManager->getConfigPortalSSID().c_str());
-    u8g2.drawStr(0, 55, "IP: 192.168.4.1");
-    u8g2.sendBuffer();
-}
-
-// Загрузка сохранённых параметров
-bool loadConfig() {
-    #include <Preferences.h>
-    Preferences prefs;
-    prefs.begin("settings", true);
-    
-    if (prefs.isKey("ntp")) {
-        strcpy(ntpServer, prefs.getString("ntp", "pool.ntp.org").c_str());
-        gmtOffsetSec = prefs.getLong("gmt", 10800);
-        strcpy(weatherCity, prefs.getString("city", "Moscow").c_str());
-        strcpy(weatherApiKey, prefs.getString("api", "").c_str());
-        prefs.end();
-        return true;
-    }
-    prefs.end();
-    return false;
-}
-
-// ========== ФУНКЦИИ ВРЕМЕНИ ==========
-void updateTimeFromNTP() {
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("Нет WiFi, используем только RTC");
-        return;
-    }
-    
-    Serial.println("Синхронизация времени с NTP...");
-    configTime(gmtOffsetSec, daylightOffsetSec, ntpServer);
-    
-    struct tm timeinfo;
-    if (!getLocalTime(&timeinfo, 10000)) {
-        Serial.println("Не удалось получить время от NTP");
-        return;
-    }
-    
-    // Установка времени в DS3231
-    rtc.adjust(DateTime(
-        timeinfo.tm_year + 1900,
-        timeinfo.tm_mon + 1,
-        timeinfo.tm_mday,
-        timeinfo.tm_hour,
-        timeinfo.tm_min,
-        timeinfo.tm_sec
-    ));
-    
-    Serial.println("Время синхронизировано и сохранено в RTC");
-}
-
-// Получение отформатированного времени
-String getFormattedTime() {
-    DateTime now = rtc.now();
-    char buffer[9];
-    sprintf(buffer, "%02d:%02d:%02d", now.hour(), now.minute(), now.second());
-    return String(buffer);
-}
-
-String getFormattedDate() {
-    DateTime now = rtc.now();
-    char buffer[12];
-    sprintf(buffer, "%02d.%02d.%04d", now.day(), now.month(), now.year());
-    return String(buffer);
-}
-
-// ========== ФУНКЦИИ ПОГОДЫ ==========
-void updateWeather() {
-    if (WiFi.status() != WL_CONNECTED || strlen(weatherApiKey) == 0) {
-        Serial.println("Нет WiFi или API ключа, пропускаем обновление погоды");
-        return;
-    }
-    
-    HTTPClient http;
-    String url = "http://api.openweathermap.org/data/2.5/weather?q=" + 
-                 String(weatherCity) + "&units=metric&appid=" + String(weatherApiKey);
-    
-    http.begin(url);
-    int httpCode = http.GET();
-    
-    if (httpCode == 200) {
-        String payload = http.getString();
-        DynamicJsonDocument doc(1024);
-        deserializeJson(doc, payload);
-        
-        weatherTemp = doc["main"]["temp"];
-        weatherHumidity = doc["main"]["humidity"];
-        weatherCondition = doc["weather"][0]["main"].as<String>();
-        
-        Serial.printf("Погода: %.1f C, %d%%, %s\n", weatherTemp, weatherHumidity, weatherCondition.c_str());
-    } else {
-        Serial.printf("Ошибка получения погоды: %d\n", httpCode);
-    }
-    
-    http.end();
-}
-
-// ========== ФУНКЦИЯ ОБНОВЛЕНИЯ ДИСПЛЕЯ ==========
-void updateDisplay() {
-    u8g2.clearBuffer();
-    
-    // Строка 1: Время (крупный шрифт)
-    u8g2.setFont(u8g2_font_logisoso22_tf);
-    u8g2.setCursor(0, 24);
-    u8g2.print(getFormattedTime());
-    
-    // Строка 2: Дата
-    u8g2.setFont(u8g2_font_6x10_tr);
-    u8g2.setCursor(0, 38);
-    u8g2.print(getFormattedDate());
-    
-    // Строка 3: Напряжение
-    u8g2.setCursor(0, 50);
-    u8g2.print("V: ");
-    u8g2.print(currentVoltage, 2);
-    u8g2.print(" V");
-    
-    // Строка 4: Погода (если есть WiFi и данные)
-    if (wifiConnected && weatherApiKey[0] != '\0') {
-        u8g2.setCursor(0, 62);
-        u8g2.print(weatherCondition.substring(0, 3));
-        u8g2.print(" ");
-        u8g2.print(weatherTemp, 1);
-        u8g2.print("C ");
-        u8g2.print(weatherHumidity);
-        u8g2.print("%");
-    } else {
-        // Или температура с RTC
-        u8g2.setCursor(0, 62);
-        u8g2.print("T: ");
-        u8g2.print(currentTemperature, 1);
-        u8g2.print("C");
-    }
-    
-    u8g2.sendBuffer();
+  unsigned long now = millis();
+  
+  if (now - lastShakeCheckTime > SHAKE_COOLDOWN) {
+    isShaking = isShakeDetected();
+    lastShakeCheckTime = now;
+    if (isShaking) lastShakeTime = now;
+  }
+  
+  updateGIF();
+  updateSound();
+  
+  switch(currentEmotion) {
+    case NORMAL:
+      if (isShaking) {
+        currentEmotion = ANGRY;
+        playAngrySound();
+        startGIF((uint8_t*)_9, sizeof(_9));
+        angryStartTime = now;
+      }
+      else if (!gifPlaying && (now - lastEmotionChange > EMOTION_INTERVAL)) {
+        lastEmotionChange = now;
+        setRandomNormalEmotion();
+      }
+      break;
+      
+    case ANGRY:
+      if (!gifPlaying || (now - angryStartTime > ANGRY_DURATION)) {
+        currentEmotion = NORMAL;
+        lastEmotionChange = now;
+        setRandomNormalEmotion();
+      }
+      break;
+  }
+  
+  delay(10);
 }
